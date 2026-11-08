@@ -1,0 +1,4 @@
+go-forwarder
+fwd*
+*.log
+.DS_Store

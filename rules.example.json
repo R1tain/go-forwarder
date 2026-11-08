@@ -1,0 +1,24 @@
+[
+  {
+    "id": 1,
+    "remark": "ss2022-hkt",
+    "listen_family": "ipv6",
+    "listen_ip": "",
+    "listen_port": 56977,
+    "protocol": "both",
+    "target": "hk-node.example.com",
+    "target_port": 56977,
+    "enabled": true
+  },
+  {
+    "id": 2,
+    "remark": "ipv4-tcp-only",
+    "listen_family": "ipv4",
+    "listen_ip": "127.0.0.1",
+    "listen_port": 8080,
+    "protocol": "tcp",
+    "target": "1.1.1.1",
+    "target_port": 8080,
+    "enabled": true
+  }
+]
