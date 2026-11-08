@@ -456,9 +456,13 @@ func isNormalClose(err error) bool {
 }
 
 func main() {
-	configPath := "/etc/realm/rules.json"
+	configPath := "/etc/go-forwarder/rules.json"
 	if len(os.Args) > 1 {
 		configPath = os.Args[1]
+	} else if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		if _, err := os.Stat("/etc/realm/rules.json"); err == nil {
+			configPath = "/etc/realm/rules.json"
+		}
 	}
 
 	data, err := os.ReadFile(configPath)
