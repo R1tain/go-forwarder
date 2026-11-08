@@ -455,26 +455,36 @@ install_forwarder(){
     systemctl stop go-forwarder 2>/dev/null || true
     cp "$src_bin" "$BIN"
     chmod +x "$BIN"
-    ok "已成功部署二进制到 $BIN"
-  elif command -v go >/dev/null 2>&1; then
-    info "未找到预编译二进制，检测到本机已安装 Go 环境，正在编译..."
-    local gocode=""
-    if [ -f "$SCRIPT_DIR/../go-forwarder-project/main.go" ]; then
-      gocode="$SCRIPT_DIR/../go-forwarder-project/main.go"
-    elif [ -f "$SCRIPT_DIR/main.go" ]; then
-      gocode="$SCRIPT_DIR/main.go"
-    fi
-    if [ -n "$gocode" ]; then
-      CGO_ENABLED=0 go build -ldflags="-s -w" -o "$BIN" "$gocode"
+    ok "已成功从本地部署二进制到 $BIN"
+  else
+    info "尝试从 GitHub 公开 Release 下载二进制..."
+    local download_url="https://github.com/R1tain/go-forwarder/releases/latest/download/go_forwarder_linux_$arch"
+    local tmp_bin="/tmp/go_forwarder_$arch"
+    if curl -sSL -f "$download_url" -o "$tmp_bin" && [ -s "$tmp_bin" ]; then
+      systemctl stop go-forwarder 2>/dev/null || true
+      mv "$tmp_bin" "$BIN"
       chmod +x "$BIN"
-      ok "编译安装成功: $BIN"
+      ok "已成功从 GitHub Release 下载并部署到 $BIN"
+    elif command -v go >/dev/null 2>&1; then
+      info "GitHub 下载不可用，检测到本机已安装 Go 环境，正在源码编译..."
+      local gocode=""
+      if [ -f "$SCRIPT_DIR/../go-forwarder-project/main.go" ]; then
+        gocode="$SCRIPT_DIR/../go-forwarder-project/main.go"
+      elif [ -f "$SCRIPT_DIR/main.go" ]; then
+        gocode="$SCRIPT_DIR/main.go"
+      fi
+      if [ -n "$gocode" ]; then
+        CGO_ENABLED=0 go build -ldflags="-s -w" -o "$BIN" "$gocode"
+        chmod +x "$BIN"
+        ok "编译安装成功: $BIN"
+      else
+        err "未找到 Go 源代码文件"
+        press_enter; return 1
+      fi
     else
-      err "未找到 Go 源代码文件"
+      err "未找到适用于当前架构 ($arch) 的 go-forwarder 二进制，且无法从 GitHub 下载"
       press_enter; return 1
     fi
-  else
-    err "未找到适用于当前架构 ($arch) 的 go-forwarder 二进制"
-    press_enter; return 1
   fi
 
   # 写入 systemd 服务文件
