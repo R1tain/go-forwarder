@@ -32,22 +32,45 @@ type Rule struct {
 }
 
 const (
-	maxUDPSessions     = 4096
-	udpSessionTimeout  = 60 * time.Second
-	udpCleanupInterval = 10 * time.Second
-	udpBufferSize      = 65535
-	tcpHalfCloseTimeout= 30 * time.Second
-	maxTCPConnections  = 10000
+	maxUDPSessions      = 4096
+	udpSessionTimeout   = 60 * time.Second
+	udpCleanupInterval  = 10 * time.Second
+	udpBufferSize       = 65535
+	tcpHalfCloseTimeout = 30 * time.Second
+	maxTCPConnections   = 10000
 )
 
 var (
-	connID  atomic.Uint64
-	tcpSem  = make(chan struct{}, maxTCPConnections)
+	connID atomic.Uint64
+	tcpSem = make(chan struct{}, maxTCPConnections)
 )
+
+// selectIP selects preferred IP matching rule's family (solves GOST multi-stack routing issue)
+func selectIP(ips []net.IP, family string) net.IP {
+	if len(ips) == 0 {
+		return nil
+	}
+	fam := strings.ToLower(strings.TrimSpace(family))
+	if fam == "ipv6" {
+		for _, ip := range ips {
+			if ip.To4() == nil {
+				return ip
+			}
+		}
+	} else if fam == "ipv4" {
+		for _, ip := range ips {
+			if ip.To4() != nil {
+				return ip
+			}
+		}
+	}
+	return ips[0]
+}
 
 // TargetResolver resolves and caches target IP/UDPAddr with periodic DDNS refresh
 type TargetResolver struct {
 	remark     string
+	family     string
 	rawTarget  string
 	port       int
 	isIP       bool
@@ -56,9 +79,10 @@ type TargetResolver struct {
 	currUDP    atomic.Pointer[net.UDPAddr]
 }
 
-func newTargetResolver(ctx context.Context, remark, rawTarget string, port int) *TargetResolver {
+func newTargetResolver(ctx context.Context, remark, family, rawTarget string, port int) *TargetResolver {
 	tr := &TargetResolver{
 		remark:     remark,
+		family:     family,
 		rawTarget:  rawTarget,
 		port:       port,
 		targetAddr: net.JoinHostPort(rawTarget, strconv.Itoa(port)),
@@ -76,7 +100,7 @@ func newTargetResolver(ctx context.Context, remark, rawTarget string, port int) 
 	ips, err := net.DefaultResolver.LookupIP(resolveCtx, "ip", rawTarget)
 	cancel()
 	if err == nil && len(ips) > 0 {
-		chosenIP := ips[0]
+		chosenIP := selectIP(ips, family)
 		tr.currIP.Store(&chosenIP)
 		tr.currUDP.Store(&net.UDPAddr{IP: chosenIP, Port: port})
 	} else {
@@ -93,7 +117,6 @@ func (tr *TargetResolver) GetUDPAddr() *net.UDPAddr {
 		return addr
 	}
 
-	// Fallback synchronous resolve if not cached yet
 	if tr.isIP {
 		if ip := net.ParseIP(tr.rawTarget); ip != nil {
 			a := &net.UDPAddr{IP: ip, Port: tr.port}
@@ -106,7 +129,7 @@ func (tr *TargetResolver) GetUDPAddr() *net.UDPAddr {
 	defer cancel()
 	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", tr.rawTarget)
 	if err == nil && len(ips) > 0 {
-		chosen := ips[0]
+		chosen := selectIP(ips, tr.family)
 		tr.currIP.Store(&chosen)
 		a := &net.UDPAddr{IP: chosen, Port: tr.port}
 		tr.currUDP.Store(a)
@@ -131,7 +154,7 @@ func (tr *TargetResolver) refreshLoop(ctx context.Context) {
 				// Keep stale IP on failure
 				continue
 			}
-			newIP := ips[0]
+			newIP := selectIP(ips, tr.family)
 			oldIP := tr.currIP.Load()
 			if oldIP == nil || !newIP.Equal(*oldIP) {
 				log.Printf("[DDNS][%s] Target %s IP changed: %v -> %v", tr.remark, tr.rawTarget, oldIP, newIP)
@@ -165,16 +188,18 @@ type udpRelay struct {
 	ctx      context.Context
 	remark   string
 	pc       net.PacketConn
+	laddr    *net.UDPAddr
 	resolver *TargetResolver
 	mu       sync.RWMutex
 	sessions map[string]*udpSession
 }
 
-func newUDPRelay(ctx context.Context, remark string, pc net.PacketConn, resolver *TargetResolver) *udpRelay {
+func newUDPRelay(ctx context.Context, remark string, pc net.PacketConn, laddr *net.UDPAddr, resolver *TargetResolver) *udpRelay {
 	return &udpRelay{
 		ctx:      ctx,
 		remark:   remark,
 		pc:       pc,
+		laddr:    laddr,
 		resolver: resolver,
 		sessions: make(map[string]*udpSession),
 	}
@@ -200,7 +225,7 @@ func (r *udpRelay) run() {
 
 		key := clientAddr.String()
 
-		// Fast path: existing session
+		// Fast path: check existing session with RLock
 		r.mu.RLock()
 		sess, ok := r.sessions[key]
 		r.mu.RUnlock()
@@ -224,8 +249,8 @@ func (r *udpRelay) createSession(clientAddr net.Addr, key string) *udpSession {
 		return nil
 	}
 
-	// Dial target UDP connection without holding the mutex
-	targetConn, err := net.DialUDP("udp", nil, targetUDP)
+	// Dial target UDP connection with explicit laddr binding if specified (solves GOST #763)
+	targetConn, err := net.DialUDP("udp", r.laddr, targetUDP)
 	if err != nil {
 		log.Printf("[WARN][%s][UDP] Connect to %s failed: %v", r.remark, targetUDP, err)
 		return nil
@@ -245,7 +270,7 @@ func (r *udpRelay) createSession(clientAddr net.Addr, key string) *udpSession {
 		return old
 	}
 
-	// Bound capacity to prevent FD exhaustion / UDP flood DoS
+	// Bound capacity to prevent FD exhaustion / UDP flood DoS (solves GOST #363)
 	if len(r.sessions) >= maxUDPSessions {
 		r.evictOldestLocked()
 	}
@@ -348,7 +373,7 @@ func (r *udpRelay) cleanupLoop() {
 	}
 }
 
-// TCP Relay with Linux splice zero-copy & proper half-close support (H5)
+// TCP Relay with Linux splice zero-copy & proper half-close support (H5, GOST #6d67be8)
 func handleTCPConnection(ctx context.Context, id uint64, remark string, client *net.TCPConn, targetAddr string, dialer *net.Dialer) {
 	defer client.Close()
 	clientAddr := client.RemoteAddr().String()
@@ -447,11 +472,6 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	dialer := &net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
 	var wg sync.WaitGroup
 	var activeListeners []io.Closer
 
@@ -493,7 +513,7 @@ func main() {
 			enableUDP = true
 		}
 
-		// Bind address & network parsing (H6, M5)
+		// Bind address & network parsing (H6, M5, GOST #763)
 		listenIP := strings.TrimSpace(rule.ListenIP)
 		listenAddr := net.JoinHostPort(listenIP, strconv.Itoa(rule.ListenPort))
 		tcpNetwork := "tcp"
@@ -517,7 +537,19 @@ func main() {
 			}
 		}
 
-		targetResolver := newTargetResolver(ctx, rule.Remark, targetHost, rule.TargetPort)
+		// TargetResolver with DDNS & Family matching
+		targetResolver := newTargetResolver(ctx, rule.Remark, rule.ListenFamily, targetHost, rule.TargetPort)
+
+		// Rule-specific Dialer binding local IP if specified (solves GOST #763 for multi-IP hosts)
+		dialer := &net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		var udpLAddr *net.UDPAddr
+		if ip := net.ParseIP(listenIP); ip != nil {
+			dialer.LocalAddr = &net.TCPAddr{IP: ip, Port: 0}
+			udpLAddr = &net.UDPAddr{IP: ip, Port: 0}
+		}
 
 		// 1. TCP Listener
 		if enableTCP {
@@ -528,7 +560,7 @@ func main() {
 				log.Printf("[INIT] Listening TCP on %s %s -> %s (%s)", tcpNetwork, listenAddr, targetResolver.targetAddr, rule.Remark)
 				activeListeners = append(activeListeners, tcpLn)
 				wg.Add(1)
-				go func(r Rule, l net.Listener, target string) {
+				go func(r Rule, l net.Listener, target string, d *net.Dialer) {
 					defer wg.Done()
 					defer l.Close()
 
@@ -539,7 +571,7 @@ func main() {
 							if errors.Is(err, net.ErrClosed) {
 								return
 							}
-							// Exponential backoff on temporary accept errors (H4)
+							// Exponential backoff on temporary accept errors (H4, GOST #914)
 							if delay == 0 {
 								delay = 5 * time.Millisecond
 							} else {
@@ -564,7 +596,7 @@ func main() {
 							continue
 						}
 
-						// Concurrency limiter check (M1)
+						// Concurrency limiter check (M1, GOST #49c998e)
 						select {
 						case tcpSem <- struct{}{}:
 						default:
@@ -580,10 +612,10 @@ func main() {
 								<-tcpSem
 								wg.Done()
 							}()
-							handleTCPConnection(ctx, cid, r.Remark, c, target, dialer)
+							handleTCPConnection(ctx, cid, r.Remark, c, target, d)
 						}(id, tc)
 					}
-				}(rule, tcpLn, targetResolver.targetAddr)
+				}(rule, tcpLn, targetResolver.targetAddr, dialer)
 			}
 		}
 
@@ -596,12 +628,12 @@ func main() {
 				log.Printf("[INIT] Listening UDP on %s %s -> %s (%s)", udpNetwork, listenAddr, targetResolver.targetAddr, rule.Remark)
 				activeListeners = append(activeListeners, udpConn)
 				wg.Add(1)
-				go func(r Rule, pc net.PacketConn, tr *TargetResolver) {
+				go func(r Rule, pc net.PacketConn, laddr *net.UDPAddr, tr *TargetResolver) {
 					defer wg.Done()
 					defer pc.Close()
-					relay := newUDPRelay(ctx, r.Remark, pc, tr)
+					relay := newUDPRelay(ctx, r.Remark, pc, laddr, tr)
 					relay.run()
-				}(rule, udpConn, targetResolver)
+				}(rule, udpConn, udpLAddr, targetResolver)
 			}
 		}
 	}
