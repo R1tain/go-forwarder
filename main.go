@@ -278,6 +278,8 @@ func (r *udpRelay) createSession(clientAddr net.Addr, key string) *udpSession {
 	r.sessions[key] = sess
 	r.mu.Unlock()
 
+	log.Printf("[%s][UDP] SESSION OPEN: %s => %s", r.remark, clientAddr, targetUDP)
+
 	// Launch downstream reader goroutine (Target -> Client)
 	go r.readDownstream(sess, key)
 
