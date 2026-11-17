@@ -279,7 +279,8 @@ collect_target_family(){
 }
 
 collect_remark(){
-  read -rp "请输入备注(可留空): " REMARK
+  read -e -rp "请输入备注(可留空): " REMARK
+  REMARK=$(printf '%s' "$REMARK" | sed -e ':a;s/[^\x08]\x08//g;ta' -e 's/[\x00-\x1f\x7f]//g')
 }
 
 # ----------------------- 规则 CRUD -----------------------
@@ -429,7 +430,8 @@ edit_rule(){
   esac
 
   # 6. 备注
-  read -rp "备注 [$cur_remark]: " val
+  read -e -rp "备注 [$cur_remark]: " val
+  val=$(printf '%s' "$val" | sed -e ':a;s/[^\x08]\x08//g;ta' -e 's/[\x00-\x1f\x7f]//g')
   REMARK=${val:-$cur_remark}
 
   jq --argjson id "$rid" \
@@ -622,7 +624,7 @@ service_menu(){
       2) systemctl stop go-forwarder && ok "服务已停止" ;;
       3) systemctl restart go-forwarder && ok "服务已重启" ;;
       4) systemctl status go-forwarder --no-pager ;;
-      5) journalctl -u go-forwarder -f -n 50 ;;
+      5) journalctl -u go-forwarder -f -n 50 -a ;;
       0) break ;;
       *) warn "无效输入" ;;
     esac

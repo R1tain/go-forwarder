@@ -46,6 +46,47 @@ var (
 	tcpSem = make(chan struct{}, maxTCPConnections)
 )
 
+// sanitizeRemark replays terminal backspace characters (\b, DEL) and strips
+// remaining control characters so systemd-journald never treats log lines as
+// binary "[blob data]".
+func sanitizeRemark(s string) string {
+	var out []rune
+	for _, r := range s {
+		switch {
+		case r == '\b' || r == 0x7f:
+			if len(out) > 0 {
+				out = out[:len(out)-1]
+			}
+		case r < 0x20:
+			// drop other ASCII control characters
+		default:
+			out = append(out, r)
+		}
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// lookupNetwork returns the Go Resolver network ("ip4", "ip6", or "ip")
+// matching targetFamily and listenFamily so single-stack rules only query
+// the needed record type (halving DNS traffic and preventing cross-family fallback).
+func lookupNetwork(targetFamily, listenFamily string) string {
+	tf := strings.ToLower(strings.TrimSpace(targetFamily))
+	switch tf {
+	case "ipv6", "v6", "6":
+		return "ip6"
+	case "ipv4", "v4", "4":
+		return "ip4"
+	case "follow", "listen":
+		lf := strings.ToLower(strings.TrimSpace(listenFamily))
+		if lf == "ipv6" {
+			return "ip6"
+		} else if lf == "ipv4" {
+			return "ip4"
+		}
+	}
+	return "ip"
+}
+
 // selectIP selects preferred IP matching targetFamily and listenFamily
 func selectIP(ips []net.IP, targetFamily, listenFamily string) net.IP {
 	if len(ips) == 0 {
@@ -59,12 +100,14 @@ func selectIP(ips []net.IP, targetFamily, listenFamily string) net.IP {
 				return ip
 			}
 		}
+		return nil
 	case "ipv4", "v4", "4":
 		for _, ip := range ips {
 			if ip.To4() != nil {
 				return ip
 			}
 		}
+		return nil
 	case "follow", "listen":
 		lf := strings.ToLower(strings.TrimSpace(listenFamily))
 		if lf == "ipv6" {
@@ -73,12 +116,14 @@ func selectIP(ips []net.IP, targetFamily, listenFamily string) net.IP {
 					return ip
 				}
 			}
+			return nil
 		} else if lf == "ipv4" {
 			for _, ip := range ips {
 				if ip.To4() != nil {
 					return ip
 				}
 			}
+			return nil
 		}
 	}
 	// "auto" or unspecified: prefer IPv6 if present (best for IPv6 DDNS), else IPv4
@@ -154,7 +199,10 @@ var directResolvers = func() []*net.Resolver {
 
 // lookupFresh resolves host bypassing local caches; falls back to system resolver.
 // Queries public direct resolvers and local resolver in parallel, taking the fastest response.
-func lookupFresh(ctx context.Context, host string) ([]net.IP, error) {
+func lookupFresh(ctx context.Context, network, host string) ([]net.IP, error) {
+	if network == "" {
+		network = "ip"
+	}
 	type res struct {
 		ips []net.IP
 		err error
@@ -165,7 +213,7 @@ func lookupFresh(ctx context.Context, host string) ([]net.IP, error) {
 
 	for _, r := range directResolvers {
 		go func(resolver *net.Resolver) {
-			ips, err := resolver.LookupIP(qctx, "ip", host)
+			ips, err := resolver.LookupIP(qctx, network, host)
 			if err == nil && len(ips) > 0 {
 				select {
 				case resCh <- res{ips: ips}:
@@ -181,7 +229,7 @@ func lookupFresh(ctx context.Context, host string) ([]net.IP, error) {
 	}
 
 	go func() {
-		ips, err := net.DefaultResolver.LookupIP(qctx, "ip", host)
+		ips, err := net.DefaultResolver.LookupIP(qctx, network, host)
 		if err == nil && len(ips) > 0 {
 			select {
 			case resCh <- res{ips: ips}:
@@ -361,8 +409,9 @@ func (tr *TargetResolver) resolve(force bool) (bool, error) {
 	}
 	tr.lastResolve = time.Now()
 
+	netType := lookupNetwork(tr.targetFamily, tr.listenFamily)
 	ctx, cancel := context.WithTimeout(tr.ctx, 8*time.Second)
-	ips, err := lookupFresh(ctx, tr.rawTarget)
+	ips, err := lookupFresh(ctx, netType, tr.rawTarget)
 	cancel()
 	if err != nil || len(ips) == 0 {
 		return false, err // keep stale IP on failure (serve-stale)
@@ -375,6 +424,9 @@ func (tr *TargetResolver) resolve(force bool) (bool, error) {
 	}
 
 	newIP := selectIP(ips, tr.targetFamily, tr.listenFamily)
+	if newIP == nil {
+		return false, fmt.Errorf("no matching %s address for %s", netType, tr.rawTarget)
+	}
 	if old != nil && newIP.Equal(old) {
 		return false, nil
 	}
@@ -817,6 +869,11 @@ func main() {
 	for _, rule := range rules {
 		if !rule.Enabled {
 			continue
+		}
+
+		rule.Remark = sanitizeRemark(rule.Remark)
+		if rule.Remark == "" {
+			rule.Remark = fmt.Sprintf("rule-%d", rule.ID)
 		}
 
 		// Validation (L1)
