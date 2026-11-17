@@ -7,7 +7,11 @@
 set -uo pipefail
 
 # ----------------------- 基础路径 -----------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ "${#BASH_SOURCE[@]}" -gt 0 ] && [ -n "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+else
+  SCRIPT_DIR="$(pwd)"
+fi
 CONFIG_DIR="/etc/go-forwarder"
 BIN="/usr/local/bin/go-forwarder"
 RULES_FILE="$CONFIG_DIR/rules.json"
@@ -443,38 +447,83 @@ install_forwarder(){
   info "当前系统架构: $arch"
 
   local installed=0
-  local download_url="https://github.com/R1tain/go-forwarder/releases/latest/download/go_forwarder_linux_$arch"
   local tmp_bin="/tmp/go_forwarder_$arch"
 
-  # 1. 主要方式: 从 GitHub 公开 Release 下载最新二进制
-  info "正在从 GitHub Release 下载二进制..."
-  info "下载地址: $download_url"
-  if curl -sSL -f --connect-timeout 10 -m 60 "$download_url" -o "$tmp_bin" && [ -s "$tmp_bin" ]; then
-    systemctl stop go-forwarder 2>/dev/null || true
-    mv "$tmp_bin" "$BIN"
-    chmod +x "$BIN"
-    ok "已成功从 GitHub Release 下载并部署到 $BIN"
-    installed=1
-  else
-    warn "GitHub 下载失败或网络不可达，尝试备用本地安装方式..."
-    # 2. 备用方式: 使用同目录预编译二进制
-    local src_bin=""
-    if [ -f "$SCRIPT_DIR/go_forwarder_linux_$arch" ]; then
-      src_bin="$SCRIPT_DIR/go_forwarder_linux_$arch"
-    elif [ -f "$SCRIPT_DIR/go-forwarder" ]; then
-      src_bin="$SCRIPT_DIR/go-forwarder"
+  # 1. 尝试从 GitHub 及国内镜像源下载最新二进制
+  local urls=(
+    "https://raw.githubusercontent.com/R1tain/script/main/go_forwarder_linux_$arch"
+    "https://ghfast.top/https://raw.githubusercontent.com/R1tain/script/main/go_forwarder_linux_$arch"
+    "https://raw.gitmirror.com/R1tain/script/main/go_forwarder_linux_$arch"
+    "https://github.com/R1tain/go-forwarder/releases/latest/download/go_forwarder_linux_$arch"
+  )
+  info "正在检索并下载二进制 ($arch)..."
+  for url in "${urls[@]}"; do
+    info "尝试下载源: $url"
+    if curl -sSL -f --connect-timeout 6 -m 30 "$url" -o "$tmp_bin" 2>/dev/null && [ -s "$tmp_bin" ]; then
+      systemctl stop go-forwarder 2>/dev/null || true
+      mv "$tmp_bin" "$BIN"
+      chmod +x "$BIN"
+      ok "已成功下载并部署到 $BIN"
+      installed=1
+      break
     fi
+  done
+
+  # 2. 备用方式: 检索本地目录预编译二进制
+  if [ $installed -eq 0 ]; then
+    warn "网络下载未成功，正在检索本地预编译二进制..."
+    local candidate_dirs=(
+      "$SCRIPT_DIR"
+      "/root/asd/zsh-script-fix"
+      "/root/asd"
+      "/root/asd/go-forwarder-project"
+    )
+    local src_bin=""
+    for d in "${candidate_dirs[@]}"; do
+      if [ -n "$d" ] && [ -f "$d/go_forwarder_linux_$arch" ]; then
+        src_bin="$d/go_forwarder_linux_$arch"
+        break
+      elif [ -n "$d" ] && [ -f "$d/go-forwarder" ]; then
+        src_bin="$d/go-forwarder"
+        break
+      fi
+    done
 
     if [ -n "$src_bin" ]; then
       systemctl stop go-forwarder 2>/dev/null || true
       cp "$src_bin" "$BIN"
       chmod +x "$BIN"
-      ok "已成功从本地预编译二进制部署到 $BIN"
+      ok "已从本地二进制部署到 $BIN ($src_bin)"
       installed=1
-    else
-      err "未找到适用于当前架构 ($arch) 的本地预编译二进制，且无法连接 GitHub 下载"
-      press_enter; return 1
     fi
+  fi
+
+  # 3. 备用方式: 如果存在 Go 编译器，现场编译
+  if [ $installed -eq 0 ] && command -v go >/dev/null 2>&1; then
+    info "未找到匹配预编译包，检测到本机已安装 Go，正在现场编译..."
+    local src_go=""
+    for d in "$SCRIPT_DIR" "/root/asd/zsh-script-fix" "/root/asd" "/root/asd/go-forwarder-project"; do
+      if [ -f "$d/go-forwarder.go" ]; then
+        src_go="$d/go-forwarder.go"
+        break
+      elif [ -f "$d/main.go" ]; then
+        src_go="$d/main.go"
+        break
+      fi
+    done
+    if [ -n "$src_go" ]; then
+      systemctl stop go-forwarder 2>/dev/null || true
+      if CGO_ENABLED=0 go build -ldflags="-s -w" -o "$BIN" "$src_go" 2>/dev/null; then
+        chmod +x "$BIN"
+        ok "现场编译成功并部署到 $BIN"
+        installed=1
+      fi
+    fi
+  fi
+
+  if [ $installed -eq 0 ]; then
+    err "未找到适用于当前架构 ($arch) 的二进制，且网络下载失败"
+    press_enter; return 1
   fi
 
   # 写入 systemd 服务文件
@@ -628,7 +677,7 @@ main_menu(){
 }
 
 # ----------------------- 入口 -----------------------
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+if [ "${#BASH_SOURCE[@]}" -eq 0 ] || [ "${BASH_SOURCE[0]}" = "$0" ]; then
   require_root
   install_deps
   init_files

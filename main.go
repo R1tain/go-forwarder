@@ -67,8 +67,118 @@ func selectIP(ips []net.IP, family string) net.IP {
 	return ips[0]
 }
 
-// TargetResolver resolves and caches target IP/UDPAddr with periodic DDNS refresh
+// ======================= DDNS-aware Target Resolver =======================
+//
+// Design goals for dynamic (DDNS) IPv6 targets:
+//  1. Bypass local DNS caches (systemd-resolved / nscd) by querying public
+//     resolvers directly; fall back to the system resolver if all fail.
+//  2. Keep the current IP as long as it is still present in the DNS answer
+//     (avoids flapping on round-robin records and needless reconnects).
+//  3. When the IP really changes, actively close TCP connections / UDP
+//     sessions still bound to the stale IP (otherwise they blackhole until
+//     keepalive gives up, which takes minutes after an IPv6 prefix change).
+//  4. When dialing fails, force an immediate re-resolve and retry once, so
+//     the outage window is not bounded by the polling interval.
+
+const (
+	ddnsRefreshInterval = 15 * time.Second
+	ddnsForceMinGap     = 3 * time.Second
+	dnsQueryTimeout     = 2 * time.Second
+)
+
+// Public resolvers queried directly (CN + global, v4 + v6). Override via
+// env GOFWD_DNS="1.1.1.1:53,[2606:4700:4700::1111]:53".
+var dnsServers = func() []string {
+	if v := strings.TrimSpace(os.Getenv("GOFWD_DNS")); v != "" {
+		var out []string
+		for _, s := range strings.Split(v, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return []string{
+		"223.5.5.5:53",
+		"119.29.29.29:53",
+		"1.1.1.1:53",
+		"8.8.8.8:53",
+		"[2400:3200::1]:53",
+		"[2606:4700:4700::1111]:53",
+	}
+}()
+
+var directResolvers = func() []*net.Resolver {
+	rs := make([]*net.Resolver, 0, len(dnsServers))
+	for _, srv := range dnsServers {
+		server := srv
+		rs = append(rs, &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				d := net.Dialer{Timeout: dnsQueryTimeout}
+				return d.DialContext(ctx, network, server)
+			},
+		})
+	}
+	return rs
+}()
+
+// lookupFresh resolves host bypassing local caches; falls back to system resolver.
+func lookupFresh(ctx context.Context, host string) ([]net.IP, error) {
+	var lastErr error
+	for _, r := range directResolvers {
+		qctx, cancel := context.WithTimeout(ctx, dnsQueryTimeout)
+		ips, err := r.LookupIP(qctx, "ip", host)
+		cancel()
+		if err == nil && len(ips) > 0 {
+			return ips, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	qctx, cancel := context.WithTimeout(ctx, dnsQueryTimeout)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(qctx, "ip", host)
+	if err == nil && len(ips) > 0 {
+		return ips, nil
+	}
+	if err == nil {
+		err = lastErr
+	}
+	return nil, err
+}
+
+func containsIP(ips []net.IP, ip net.IP) bool {
+	for _, x := range ips {
+		if x.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func familyOK(ip net.IP, family string) bool {
+	switch strings.ToLower(strings.TrimSpace(family)) {
+	case "ipv6":
+		return ip.To4() == nil
+	case "ipv4":
+		return ip.To4() != nil
+	}
+	return true
+}
+
+// trackedConn is an active TCP relay bound to a specific target IP.
+type trackedConn struct {
+	ip    net.IP
+	close func()
+}
+
 type TargetResolver struct {
+	ctx        context.Context
 	remark     string
 	family     string
 	rawTarget  string
@@ -77,97 +187,184 @@ type TargetResolver struct {
 	targetAddr string
 	currIP     atomic.Pointer[net.IP]
 	currUDP    atomic.Pointer[net.UDPAddr]
+
+	refreshMu   sync.Mutex // serializes resolves
+	lastResolve time.Time
+
+	connMu sync.Mutex
+	conns  map[*trackedConn]struct{}
+
+	listenMu  sync.Mutex
+	listeners []func(validIPs []net.IP)
 }
 
 func newTargetResolver(ctx context.Context, remark, family, rawTarget string, port int) *TargetResolver {
 	tr := &TargetResolver{
+		ctx:        ctx,
 		remark:     remark,
 		family:     family,
 		rawTarget:  rawTarget,
 		port:       port,
 		targetAddr: net.JoinHostPort(rawTarget, strconv.Itoa(port)),
+		conns:      make(map[*trackedConn]struct{}),
 	}
 
 	if ip := net.ParseIP(rawTarget); ip != nil {
 		tr.isIP = true
-		tr.currIP.Store(&ip)
-		tr.currUDP.Store(&net.UDPAddr{IP: ip, Port: port})
+		tr.storeIP(ip)
 		return tr
 	}
 
-	// Hostname: initial resolve
-	resolveCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	ips, err := net.DefaultResolver.LookupIP(resolveCtx, "ip", rawTarget)
-	cancel()
-	if err == nil && len(ips) > 0 {
-		chosenIP := selectIP(ips, family)
-		tr.currIP.Store(&chosenIP)
-		tr.currUDP.Store(&net.UDPAddr{IP: chosenIP, Port: port})
-	} else {
-		log.Printf("[WARN][%s] Initial DNS resolve for %s failed: %v (will retry in background)", remark, rawTarget, err)
+	// Initial resolve: wait at most 3s so a DNS outage doesn't stall startup of
+	// every rule; until resolved, dials fall back to "host:port" (system resolver).
+	done := make(chan error, 1)
+	go func() { _, err := tr.resolve(true); done <- err }()
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Printf("[WARN][%s] Initial DNS resolve for %s failed: %v (will retry in background)", remark, rawTarget, err)
+		}
+	case <-time.After(3 * time.Second):
+		log.Printf("[WARN][%s] Initial DNS resolve for %s is slow, continuing in background", remark, rawTarget)
 	}
-
-	go tr.refreshLoop(ctx)
+	go tr.refreshLoop()
 	return tr
 }
 
-func (tr *TargetResolver) GetUDPAddr() *net.UDPAddr {
-	addr := tr.currUDP.Load()
-	if addr != nil {
-		return addr
-	}
+func (tr *TargetResolver) storeIP(ip net.IP) {
+	tr.currIP.Store(&ip)
+	tr.currUDP.Store(&net.UDPAddr{IP: ip, Port: tr.port})
+}
 
-	if tr.isIP {
-		if ip := net.ParseIP(tr.rawTarget); ip != nil {
-			a := &net.UDPAddr{IP: ip, Port: tr.port}
-			tr.currUDP.Store(a)
-			return a
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", tr.rawTarget)
-	if err == nil && len(ips) > 0 {
-		chosen := selectIP(ips, tr.family)
-		tr.currIP.Store(&chosen)
-		a := &net.UDPAddr{IP: chosen, Port: tr.port}
-		tr.currUDP.Store(a)
-		return a
+// CurrentIP returns the cached target IP (nil if never resolved).
+func (tr *TargetResolver) CurrentIP() net.IP {
+	if p := tr.currIP.Load(); p != nil {
+		return *p
 	}
 	return nil
 }
 
-func (tr *TargetResolver) refreshLoop(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+// GetTargetAddr returns "ip:port" of the cached target, or "host:port" if unresolved.
+func (tr *TargetResolver) GetTargetAddr() string {
+	if ip := tr.CurrentIP(); ip != nil {
+		return net.JoinHostPort(ip.String(), strconv.Itoa(tr.port))
+	}
+	return tr.targetAddr
+}
 
+func (tr *TargetResolver) GetUDPAddr() *net.UDPAddr {
+	if a := tr.currUDP.Load(); a != nil {
+		return a
+	}
+	if !tr.isIP {
+		_, _ = tr.resolve(true)
+	}
+	return tr.currUDP.Load()
+}
+
+// OnChange registers a callback fired (async) when the target IP changes.
+// validIPs is the full fresh DNS answer; anything bound to an IP outside it is stale.
+func (tr *TargetResolver) OnChange(fn func(validIPs []net.IP)) {
+	tr.listenMu.Lock()
+	tr.listeners = append(tr.listeners, fn)
+	tr.listenMu.Unlock()
+}
+
+// resolve performs a fresh lookup. force=false honours ddnsForceMinGap to
+// avoid hammering DNS when many dials fail at once. Returns true if IP changed.
+func (tr *TargetResolver) resolve(force bool) (bool, error) {
+	if tr.isIP {
+		return false, nil
+	}
+	tr.refreshMu.Lock()
+	defer tr.refreshMu.Unlock()
+
+	if !force && time.Since(tr.lastResolve) < ddnsForceMinGap {
+		return false, nil
+	}
+	tr.lastResolve = time.Now()
+
+	ctx, cancel := context.WithTimeout(tr.ctx, 8*time.Second)
+	ips, err := lookupFresh(ctx, tr.rawTarget)
+	cancel()
+	if err != nil || len(ips) == 0 {
+		return false, err // keep stale IP on failure (serve-stale)
+	}
+
+	old := tr.CurrentIP()
+	// Sticky: keep current IP if it is still a valid, family-compatible answer.
+	if old != nil && containsIP(ips, old) && familyOK(old, tr.family) {
+		return false, nil
+	}
+
+	newIP := selectIP(ips, tr.family)
+	if old != nil && newIP.Equal(old) {
+		return false, nil
+	}
+	log.Printf("[DDNS][%s] Target %s IP changed: %v -> %v", tr.remark, tr.rawTarget, old, newIP)
+	tr.storeIP(newIP)
+
+	if old != nil {
+		tr.closeStale(ips)
+		tr.listenMu.Lock()
+		ls := append([]func([]net.IP){}, tr.listeners...)
+		tr.listenMu.Unlock()
+		for _, fn := range ls {
+			go fn(ips)
+		}
+	}
+	return true, nil
+}
+
+func (tr *TargetResolver) refreshLoop() {
+	ticker := time.NewTicker(ddnsRefreshInterval)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-tr.ctx.Done():
 			return
 		case <-ticker.C:
-			resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			ips, err := net.DefaultResolver.LookupIP(resolveCtx, "ip", tr.rawTarget)
-			cancel()
-			if err != nil || len(ips) == 0 {
-				// Keep stale IP on failure
-				continue
-			}
-			newIP := selectIP(ips, tr.family)
-			oldIP := tr.currIP.Load()
-			if oldIP == nil || !newIP.Equal(*oldIP) {
-				log.Printf("[DDNS][%s] Target %s IP changed: %v -> %v", tr.remark, tr.rawTarget, oldIP, newIP)
-				tr.currIP.Store(&newIP)
-				tr.currUDP.Store(&net.UDPAddr{IP: newIP, Port: tr.port})
-			}
+			_, _ = tr.resolve(true)
 		}
+	}
+}
+
+// track registers an active TCP relay; returns an untrack func.
+func (tr *TargetResolver) track(ip net.IP, closeFn func()) func() {
+	tc := &trackedConn{ip: ip, close: closeFn}
+	tr.connMu.Lock()
+	tr.conns[tc] = struct{}{}
+	tr.connMu.Unlock()
+	return func() {
+		tr.connMu.Lock()
+		delete(tr.conns, tc)
+		tr.connMu.Unlock()
+	}
+}
+
+// closeStale closes TCP relays whose target IP is no longer in the DNS answer.
+func (tr *TargetResolver) closeStale(validIPs []net.IP) {
+	var stale []*trackedConn
+	tr.connMu.Lock()
+	for c := range tr.conns {
+		if !containsIP(validIPs, c.ip) {
+			stale = append(stale, c)
+			delete(tr.conns, c)
+		}
+	}
+	tr.connMu.Unlock()
+	if len(stale) > 0 {
+		log.Printf("[DDNS][%s] Closing %d stale TCP connection(s) bound to old IP", tr.remark, len(stale))
+	}
+	for _, c := range stale {
+		c.close()
 	}
 }
 
 // udpSession represents a bidirectional UDP forwarding session
 type udpSession struct {
 	clientAddr net.Addr
+	targetIP   net.IP
 	targetConn *net.UDPConn
 	lastActive atomic.Int64
 	closed     atomic.Bool
@@ -195,13 +392,35 @@ type udpRelay struct {
 }
 
 func newUDPRelay(ctx context.Context, remark string, pc net.PacketConn, laddr *net.UDPAddr, resolver *TargetResolver) *udpRelay {
-	return &udpRelay{
+	r := &udpRelay{
 		ctx:      ctx,
 		remark:   remark,
 		pc:       pc,
 		laddr:    laddr,
 		resolver: resolver,
 		sessions: make(map[string]*udpSession),
+	}
+	// On DDNS change, drop sessions bound to the stale IP. Active clients keep
+	// refreshing lastActive, so without this they'd never migrate to the new IP.
+	resolver.OnChange(r.dropStale)
+	return r
+}
+
+func (r *udpRelay) dropStale(validIPs []net.IP) {
+	var stale []*udpSession
+	r.mu.Lock()
+	for k, s := range r.sessions {
+		if !containsIP(validIPs, s.targetIP) {
+			delete(r.sessions, k)
+			stale = append(stale, s)
+		}
+	}
+	r.mu.Unlock()
+	if len(stale) > 0 {
+		log.Printf("[DDNS][%s][UDP] Dropping %d stale session(s) bound to old IP", r.remark, len(stale))
+	}
+	for _, s := range stale {
+		s.Close()
 	}
 }
 
@@ -238,7 +457,11 @@ func (r *udpRelay) run() {
 		}
 
 		sess.lastActive.Store(time.Now().Unix())
-		_, _ = sess.targetConn.Write(buf[:n])
+		if _, werr := sess.targetConn.Write(buf[:n]); werr != nil && !sess.closed.Load() {
+			// e.g. ENETUNREACH after IPv6 prefix change: drop session and re-resolve.
+			r.removeSession(key, sess)
+			go func() { _, _ = r.resolver.resolve(false) }()
+		}
 	}
 }
 
@@ -252,12 +475,22 @@ func (r *udpRelay) createSession(clientAddr net.Addr, key string) *udpSession {
 	// Dial target UDP connection with explicit laddr binding if specified (solves GOST #763)
 	targetConn, err := net.DialUDP("udp", r.laddr, targetUDP)
 	if err != nil {
-		log.Printf("[WARN][%s][UDP] Connect to %s failed: %v", r.remark, targetUDP, err)
-		return nil
+		// Possibly a stale/unroutable IP after a prefix change: force re-resolve and retry once.
+		if changed, _ := r.resolver.resolve(false); changed {
+			if t2 := r.resolver.GetUDPAddr(); t2 != nil {
+				targetUDP = t2
+				targetConn, err = net.DialUDP("udp", r.laddr, targetUDP)
+			}
+		}
+		if err != nil {
+			log.Printf("[WARN][%s][UDP] Connect to %s failed: %v", r.remark, targetUDP, err)
+			return nil
+		}
 	}
 
 	sess := &udpSession{
 		clientAddr: clientAddr,
+		targetIP:   targetUDP.IP,
 		targetConn: targetConn,
 	}
 	sess.lastActive.Store(time.Now().Unix())
@@ -376,13 +609,23 @@ func (r *udpRelay) cleanupLoop() {
 }
 
 // TCP Relay with Linux splice zero-copy & proper half-close support (H5, GOST #6d67be8)
-func handleTCPConnection(ctx context.Context, id uint64, remark string, client *net.TCPConn, targetAddr string, dialer *net.Dialer) {
+func handleTCPConnection(ctx context.Context, id uint64, remark string, client *net.TCPConn, tr *TargetResolver, dialer *net.Dialer) {
 	defer client.Close()
 	clientAddr := client.RemoteAddr().String()
 	startTime := time.Now()
 
-	// Dial target with context
+	// Dial the currently cached target IP; on failure force a fresh DNS lookup
+	// and retry once if the IP changed (shrinks the DDNS outage window).
+	targetAddr := tr.GetTargetAddr()
 	conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+	if err != nil && !tr.isIP {
+		if changed, _ := tr.resolve(false); changed {
+			retryAddr := tr.GetTargetAddr()
+			log.Printf("[#%d][%s] Dial %s failed (%v), retrying with refreshed target %s", id, remark, targetAddr, err, retryAddr)
+			targetAddr = retryAddr
+			conn, err = dialer.DialContext(ctx, "tcp", targetAddr)
+		}
+	}
 	if err != nil {
 		log.Printf("[#%d][%s] Connect to target %s failed: %v (client: %s)", id, remark, targetAddr, err, clientAddr)
 		return
@@ -394,12 +637,25 @@ func handleTCPConnection(ctx context.Context, id uint64, remark string, client *
 		return
 	}
 
+	// Register so a DDNS change can tear this relay down if its IP goes stale.
+	var dialedIP net.IP
+	if ra, ok := target.RemoteAddr().(*net.TCPAddr); ok {
+		dialedIP = ra.IP
+	}
+	if dialedIP != nil && !tr.isIP {
+		untrack := tr.track(dialedIP, func() {
+			_ = client.Close()
+			_ = target.Close()
+		})
+		defer untrack()
+	}
+
 	_ = client.SetNoDelay(true)
 	_ = target.SetNoDelay(true)
 	_ = client.SetKeepAlive(true)
 	_ = client.SetKeepAlivePeriod(30 * time.Second)
 	_ = target.SetKeepAlive(true)
-	_ = target.SetKeepAlivePeriod(30 * time.Second)
+	_ = target.SetKeepAlivePeriod(15 * time.Second)
 
 	remoteTargetAddr := target.RemoteAddr().String()
 	log.Printf("[#%d][%s][TCP] ESTABLISHED: %s => %s (target IP: %s)", id, remark, clientAddr, targetAddr, remoteTargetAddr)
@@ -566,7 +822,7 @@ func main() {
 				log.Printf("[INIT] Listening TCP on %s %s -> %s (%s)", tcpNetwork, listenAddr, targetResolver.targetAddr, rule.Remark)
 				activeListeners = append(activeListeners, tcpLn)
 				wg.Add(1)
-				go func(r Rule, l net.Listener, target string, d *net.Dialer) {
+				go func(r Rule, l net.Listener, tr *TargetResolver, d *net.Dialer) {
 					defer wg.Done()
 					defer l.Close()
 
@@ -618,10 +874,10 @@ func main() {
 								<-tcpSem
 								wg.Done()
 							}()
-							handleTCPConnection(ctx, cid, r.Remark, c, target, d)
+							handleTCPConnection(ctx, cid, r.Remark, c, tr, d)
 						}(id, tc)
 					}
-				}(rule, tcpLn, targetResolver.targetAddr, dialer)
+				}(rule, tcpLn, targetResolver, dialer)
 			}
 		}
 

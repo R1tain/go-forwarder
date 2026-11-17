@@ -16,7 +16,10 @@ High-performance Layer-4 TCP/UDP port forwarder written in Go, featuring Linux k
   - Maximum session cap (`maxUDPSessions = 4096`) with LRU eviction to prevent FD exhaustion and DoS.
   - Zero lock contention on the UDP hot path.
 - **🌐 Dynamic DDNS Auto-Refresh**:
-  Background periodic DNS resolver (every 30s) with serve-stale resilience (keeps old IP if DNS queries fail temporarily).
+  - Queries public resolvers directly (bypasses systemd-resolved/nscd caches), falls back to system DNS; override with `GOFWD_DNS="1.1.1.1:53,[2606:4700:4700::1111]:53"`.
+  - Background refresh every 15s with serve-stale resilience and sticky IP selection (no flapping on multi-record answers).
+  - On dial failure, forces an immediate re-resolve and retries once with the new IP.
+  - On IP change, actively closes TCP connections and drops UDP sessions still bound to the stale IP, so clients reconnect instantly instead of hanging after an IPv6 prefix change.
 - **⚙️ Fault-Tolerant Listener Loops**:
   Exponential backoff (5ms up to 1s) upon temporary accept errors (e.g. `EMFILE`), preventing listener threads from prematurely exiting.
 - **🛑 Graceful Shutdown**:
