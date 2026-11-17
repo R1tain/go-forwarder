@@ -27,6 +27,7 @@ type Rule struct {
 	Protocol     string `json:"protocol"` // "tcp", "udp", "both", "all", "tcp+udp"
 	Target       string `json:"target"`
 	TargetPort   int    `json:"target_port"`
+	TargetFamily string `json:"target_family,omitempty"` // "ipv6", "ipv4", "auto", "follow"
 	Enabled      bool   `json:"enabled"`
 	Created      string `json:"created,omitempty"`
 }
@@ -45,23 +46,45 @@ var (
 	tcpSem = make(chan struct{}, maxTCPConnections)
 )
 
-// selectIP selects preferred IP matching rule's family (solves GOST multi-stack routing issue)
-func selectIP(ips []net.IP, family string) net.IP {
+// selectIP selects preferred IP matching targetFamily and listenFamily
+func selectIP(ips []net.IP, targetFamily, listenFamily string) net.IP {
 	if len(ips) == 0 {
 		return nil
 	}
-	fam := strings.ToLower(strings.TrimSpace(family))
-	if fam == "ipv6" {
+	tf := strings.ToLower(strings.TrimSpace(targetFamily))
+	switch tf {
+	case "ipv6", "v6", "6":
 		for _, ip := range ips {
 			if ip.To4() == nil {
 				return ip
 			}
 		}
-	} else if fam == "ipv4" {
+	case "ipv4", "v4", "4":
 		for _, ip := range ips {
 			if ip.To4() != nil {
 				return ip
 			}
+		}
+	case "follow", "listen":
+		lf := strings.ToLower(strings.TrimSpace(listenFamily))
+		if lf == "ipv6" {
+			for _, ip := range ips {
+				if ip.To4() == nil {
+					return ip
+				}
+			}
+		} else if lf == "ipv4" {
+			for _, ip := range ips {
+				if ip.To4() != nil {
+					return ip
+				}
+			}
+		}
+	}
+	// "auto" or unspecified: prefer IPv6 if present (best for IPv6 DDNS), else IPv4
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			return ip
 		}
 	}
 	return ips[0]
@@ -126,30 +149,70 @@ var directResolvers = func() []*net.Resolver {
 }()
 
 // lookupFresh resolves host bypassing local caches; falls back to system resolver.
+// Queries public direct resolvers and local resolver in parallel, taking the fastest response.
 func lookupFresh(ctx context.Context, host string) ([]net.IP, error) {
-	var lastErr error
-	for _, r := range directResolvers {
-		qctx, cancel := context.WithTimeout(ctx, dnsQueryTimeout)
-		ips, err := r.LookupIP(qctx, "ip", host)
-		cancel()
-		if err == nil && len(ips) > 0 {
-			return ips, nil
-		}
-		lastErr = err
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
+	type res struct {
+		ips []net.IP
+		err error
 	}
-	qctx, cancel := context.WithTimeout(ctx, dnsQueryTimeout)
+	resCh := make(chan res, len(directResolvers)+1)
+	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(qctx, "ip", host)
-	if err == nil && len(ips) > 0 {
-		return ips, nil
+
+	for _, r := range directResolvers {
+		go func(resolver *net.Resolver) {
+			ips, err := resolver.LookupIP(qctx, "ip", host)
+			if err == nil && len(ips) > 0 {
+				select {
+				case resCh <- res{ips: ips}:
+				case <-qctx.Done():
+				}
+			} else {
+				select {
+				case resCh <- res{err: err}:
+				case <-qctx.Done():
+				}
+			}
+		}(r)
 	}
-	if err == nil {
-		err = lastErr
+
+	go func() {
+		ips, err := net.DefaultResolver.LookupIP(qctx, "ip", host)
+		if err == nil && len(ips) > 0 {
+			select {
+			case resCh <- res{ips: ips}:
+			case <-qctx.Done():
+			}
+		} else {
+			select {
+			case resCh <- res{err: err}:
+			case <-qctx.Done():
+			}
+		}
+	}()
+
+	total := len(directResolvers) + 1
+	var lastErr error
+	for i := 0; i < total; i++ {
+		select {
+		case r := <-resCh:
+			if len(r.ips) > 0 {
+				return r.ips, nil
+			}
+			if r.err != nil {
+				lastErr = r.err
+			}
+		case <-qctx.Done():
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, qctx.Err()
+		}
 	}
-	return nil, err
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no IP resolved for %s", host)
 }
 
 func containsIP(ips []net.IP, ip net.IP) bool {
@@ -161,12 +224,20 @@ func containsIP(ips []net.IP, ip net.IP) bool {
 	return false
 }
 
-func familyOK(ip net.IP, family string) bool {
-	switch strings.ToLower(strings.TrimSpace(family)) {
-	case "ipv6":
+func familyOK(ip net.IP, targetFamily, listenFamily string) bool {
+	tf := strings.ToLower(strings.TrimSpace(targetFamily))
+	switch tf {
+	case "ipv6", "v6", "6":
 		return ip.To4() == nil
-	case "ipv4":
+	case "ipv4", "v4", "4":
 		return ip.To4() != nil
+	case "follow", "listen":
+		lf := strings.ToLower(strings.TrimSpace(listenFamily))
+		if lf == "ipv6" {
+			return ip.To4() == nil
+		} else if lf == "ipv4" {
+			return ip.To4() != nil
+		}
 	}
 	return true
 }
@@ -178,15 +249,16 @@ type trackedConn struct {
 }
 
 type TargetResolver struct {
-	ctx        context.Context
-	remark     string
-	family     string
-	rawTarget  string
-	port       int
-	isIP       bool
-	targetAddr string
-	currIP     atomic.Pointer[net.IP]
-	currUDP    atomic.Pointer[net.UDPAddr]
+	ctx          context.Context
+	remark       string
+	targetFamily string
+	listenFamily string
+	rawTarget    string
+	port         int
+	isIP         bool
+	targetAddr   string
+	currIP       atomic.Pointer[net.IP]
+	currUDP      atomic.Pointer[net.UDPAddr]
 
 	refreshMu   sync.Mutex // serializes resolves
 	lastResolve time.Time
@@ -198,15 +270,16 @@ type TargetResolver struct {
 	listeners []func(validIPs []net.IP)
 }
 
-func newTargetResolver(ctx context.Context, remark, family, rawTarget string, port int) *TargetResolver {
+func newTargetResolver(ctx context.Context, remark, targetFamily, listenFamily, rawTarget string, port int) *TargetResolver {
 	tr := &TargetResolver{
-		ctx:        ctx,
-		remark:     remark,
-		family:     family,
-		rawTarget:  rawTarget,
-		port:       port,
-		targetAddr: net.JoinHostPort(rawTarget, strconv.Itoa(port)),
-		conns:      make(map[*trackedConn]struct{}),
+		ctx:          ctx,
+		remark:       remark,
+		targetFamily: targetFamily,
+		listenFamily: listenFamily,
+		rawTarget:    rawTarget,
+		port:         port,
+		targetAddr:   net.JoinHostPort(rawTarget, strconv.Itoa(port)),
+		conns:        make(map[*trackedConn]struct{}),
 	}
 
 	if ip := net.ParseIP(rawTarget); ip != nil {
@@ -293,11 +366,11 @@ func (tr *TargetResolver) resolve(force bool) (bool, error) {
 
 	old := tr.CurrentIP()
 	// Sticky: keep current IP if it is still a valid, family-compatible answer.
-	if old != nil && containsIP(ips, old) && familyOK(old, tr.family) {
+	if old != nil && containsIP(ips, old) && familyOK(old, tr.targetFamily, tr.listenFamily) {
 		return false, nil
 	}
 
-	newIP := selectIP(ips, tr.family)
+	newIP := selectIP(ips, tr.targetFamily, tr.listenFamily)
 	if old != nil && newIP.Equal(old) {
 		return false, nil
 	}
@@ -800,7 +873,7 @@ func main() {
 		}
 
 		// TargetResolver with DDNS & Family matching
-		targetResolver := newTargetResolver(ctx, rule.Remark, rule.ListenFamily, targetHost, rule.TargetPort)
+		targetResolver := newTargetResolver(ctx, rule.Remark, rule.TargetFamily, rule.ListenFamily, targetHost, rule.TargetPort)
 
 		// Rule-specific Dialer binding local IP if specified (solves GOST #763 for multi-IP hosts)
 		dialer := &net.Dialer{
@@ -808,10 +881,6 @@ func main() {
 			KeepAlive: 30 * time.Second,
 		}
 		var udpLAddr *net.UDPAddr
-		if ip := net.ParseIP(listenIP); ip != nil {
-			dialer.LocalAddr = &net.TCPAddr{IP: ip, Port: 0}
-			udpLAddr = &net.UDPAddr{IP: ip, Port: 0}
-		}
 
 		// 1. TCP Listener
 		if enableTCP {

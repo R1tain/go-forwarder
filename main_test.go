@@ -13,7 +13,7 @@ import (
 func TestCloseStaleAndSticky(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	tr := &TargetResolver{ctx: ctx, remark: "t", family: "ipv6", rawTarget: "x", port: 1,
+	tr := &TargetResolver{ctx: ctx, remark: "t", targetFamily: "ipv6", listenFamily: "dual", rawTarget: "x", port: 1,
 		conns: make(map[*trackedConn]struct{})}
 
 	oldIP := net.ParseIP("2404:c805:5a03:5301::5f9")
@@ -36,11 +36,17 @@ func TestCloseStaleAndSticky(t *testing.T) {
 
 	// familyOK / selectIP behaviour for ipv6 rules
 	v4 := net.ParseIP("1.2.3.4")
-	if familyOK(v4, "ipv6") || !familyOK(newIP, "ipv6") || !familyOK(v4, "dual") {
+	if familyOK(v4, "ipv6", "dual") || !familyOK(newIP, "ipv6", "dual") || !familyOK(v4, "auto", "dual") {
 		t.Fatal("familyOK wrong")
 	}
-	if got := selectIP([]net.IP{v4, newIP}, "ipv6"); !got.Equal(newIP) {
+	if got := selectIP([]net.IP{v4, newIP}, "ipv6", "dual"); !got.Equal(newIP) {
 		t.Fatalf("selectIP ipv6 picked %v", got)
+	}
+	if got := selectIP([]net.IP{v4, newIP}, "auto", "dual"); !got.Equal(newIP) {
+		t.Fatalf("selectIP auto should prefer ipv6, got %v", got)
+	}
+	if got := selectIP([]net.IP{v4, newIP}, "ipv4", "dual"); !got.Equal(v4) {
+		t.Fatalf("selectIP ipv4 picked %v", got)
 	}
 	if got := tr.GetTargetAddr(); got != "[2404:c805:5a03:5301::5f9]:1" {
 		t.Fatalf("GetTargetAddr=%s", got)

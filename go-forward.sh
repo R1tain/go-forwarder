@@ -256,6 +256,28 @@ collect_target(){
   done
 }
 
+collect_target_family(){
+  local def=${1:-1}
+  echo ""
+  echo "请选择目标解析策略 (Target Family):"
+  echo "  1) 自动 / IPv6优先 (默认推荐, 专为家庭宽带/DDNS IPv6 优化)"
+  echo "  2) 仅 IPv6 (目标强制使用 AAAA 记录)"
+  echo "  3) 仅 IPv4 (目标强制使用 A 记录)"
+  echo "  4) 跟随本地监听类型"
+  local c
+  while true; do
+    read -rp "请输入选项 [1-4, 默认$def]: " c
+    c=${c:-$def}
+    case $c in
+      1) TARGET_FAMILY="auto"; break ;;
+      2) TARGET_FAMILY="ipv6"; break ;;
+      3) TARGET_FAMILY="ipv4"; break ;;
+      4) TARGET_FAMILY="follow"; break ;;
+      *) warn "无效输入" ;;
+    esac
+  done
+}
+
 collect_remark(){
   read -rp "请输入备注(可留空): " REMARK
 }
@@ -268,6 +290,7 @@ add_rule(){
   collect_port ""
   collect_protocol 1
   collect_target
+  collect_target_family 1
   collect_remark
 
   local max_id next_id now
@@ -285,8 +308,9 @@ add_rule(){
     --arg proto "$PROTO" \
     --arg target "$TARGET_ADDR" \
     --argjson tp "$TARGET_PORT" \
+    --arg tf "$TARGET_FAMILY" \
     --arg created "$now" \
-    '{id:$id, remark:$remark, listen_family:$lf, listen_ip:$lip, listen_port:$lp, protocol:$proto, target:$target, target_port:$tp, enabled:true, created:$created}')
+    '{id:$id, remark:$remark, listen_family:$lf, listen_ip:$lip, listen_port:$lp, protocol:$proto, target:$target, target_port:$tp, target_family:$tf, enabled:true, created:$created}')
 
   jq --argjson rule "$new_rule" '. += [$rule]' "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"
   apply_changes "规则 #$next_id 添加成功"
@@ -322,6 +346,14 @@ list_rules(){
 
     listen_str=$(display_listen_string "$fam" "$ip" "$port")
     target_str=$(format_target "$target" "$tport")
+    local tf tf_tag=""
+    tf=$(echo "$row" | jq -r '.target_family // "auto"')
+    case $tf in
+      ipv6) tf_tag=" (v6)" ;;
+      ipv4) tf_tag=" (v4)" ;;
+      follow) tf_tag=" (同监听)" ;;
+    esac
+    target_str="${target_str}${tf_tag}"
     [ "$en" = "true" ] && status_str="${GREEN}启用${NC}" || status_str="${RED}禁用${NC}"
 
     printf "%-4s | %-12s | %-24s | %-8s | %-30s | %b\n" \
@@ -338,7 +370,7 @@ edit_rule(){
     err "未找到 ID 为 $rid 的规则"; press_enter; return
   fi
 
-  local cur_row cur_remark cur_fam cur_ip cur_lp cur_proto cur_target cur_tp
+  local cur_row cur_remark cur_fam cur_ip cur_lp cur_proto cur_target cur_tp cur_tf
   cur_row=$(jq -c --argjson id "$rid" '.[] | select(.id==$id)' "$RULES_FILE")
   cur_remark=$(echo "$cur_row" | jq -r '.remark // ""')
   cur_fam=$(echo "$cur_row" | jq -r '.listen_family // "dual"')
@@ -347,8 +379,9 @@ edit_rule(){
   cur_proto=$(echo "$cur_row" | jq -r '.protocol // "both"')
   cur_target=$(echo "$cur_row" | jq -r '.target')
   cur_tp=$(echo "$cur_row" | jq -r '.target_port')
+  cur_tf=$(echo "$cur_row" | jq -r '.target_family // "auto"')
 
-  echo "当前规则: ID=$rid | 备注=$cur_remark | 监听=$cur_lp($cur_fam) | 协议=$cur_proto | 目标=$cur_target:$cur_tp"
+  echo "当前规则: ID=$rid | 备注=$cur_remark | 监听=$cur_lp($cur_fam) | 协议=$cur_proto | 目标=$cur_target:$cur_tp ($cur_tf)"
   echo "提示: 如不修改某项，直接回车保持当前值"
 
   # 1. 监听端口
@@ -374,7 +407,18 @@ edit_rule(){
     TARGET_PORT=$cur_tp
   fi
 
-  # 4. 协议
+  # 4. 目标解析策略
+  echo "目标解析策略 1) 自动/IPv6优先 2) 仅IPv6 3) 仅IPv4 4) 跟随监听 [当前: $cur_tf]"
+  read -rp "请选择 [留空保持不变]: " val
+  case $val in
+    1) TARGET_FAMILY=auto ;;
+    2) TARGET_FAMILY=ipv6 ;;
+    3) TARGET_FAMILY=ipv4 ;;
+    4) TARGET_FAMILY=follow ;;
+    *) TARGET_FAMILY=$cur_tf ;;
+  esac
+
+  # 5. 协议
   echo "转发协议 1) TCP+UDP 2) 仅TCP 3) 仅UDP [当前: $(proto_display "$cur_proto")]"
   read -rp "请选择 [留空保持不变]: " val
   case $val in
@@ -384,7 +428,7 @@ edit_rule(){
     *) PROTO=$cur_proto ;;
   esac
 
-  # 5. 备注
+  # 6. 备注
   read -rp "备注 [$cur_remark]: " val
   REMARK=${val:-$cur_remark}
 
@@ -394,7 +438,8 @@ edit_rule(){
      --arg proto "$PROTO" \
      --arg target "$TARGET_ADDR" \
      --argjson tp "$TARGET_PORT" \
-     'map(if .id == $id then .remark=$remark | .listen_port=$lp | .protocol=$proto | .target=$target | .target_port=$tp else . end)' \
+     --arg tf "$TARGET_FAMILY" \
+     'map(if .id == $id then .remark=$remark | .listen_port=$lp | .protocol=$proto | .target=$target | .target_port=$tp | .target_family=$tf else . end)' \
      "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"
 
   apply_changes "规则 #$rid 修改成功"
